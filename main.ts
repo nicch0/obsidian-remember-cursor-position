@@ -1,4 +1,5 @@
-import { App, Plugin, PluginSettingTab, Setting, MarkdownView, TAbstractFile, Editor } from 'obsidian';
+import { EditorView, ViewPlugin, ViewUpdate } from "@codemirror/view";
+import { App, Plugin, PluginSettingTab, Setting, MarkdownView, TAbstractFile } from 'obsidian';
 
 interface PluginSettings {
 	dbFileName: string;
@@ -28,15 +29,14 @@ interface EphemeralState {
 	scroll?: number
 }
 
+type LeafId = string;
+type FileName = string;
 
 export default class RememberCursorPosition extends Plugin {
 	settings: PluginSettings;
 	db: { [file_path: string]: EphemeralState };
 	lastSavedDb: { [file_path: string]: EphemeralState };
-	lastEphemeralState: EphemeralState;
-	lastLoadedFileName: string;
-	loadedLeafIdList: string[] = [];
-	loadingFile = false;
+	loadedLeavesCache: Set<[LeafId, FileName]> = new Set();
 
 	async onload() {
 		await this.loadSettings();
@@ -54,34 +54,82 @@ export default class RememberCursorPosition extends Plugin {
 
 		this.addSettingTab(new SettingTab(this.app, this));
 
+		// Restores the cursor/scroll position when a new markdown file is open
 		this.registerEvent(
-			this.app.workspace.on('file-open', (file) => this.restoreEphemeralState())
-		);
-		
-
-		this.registerEvent(
-			this.app.workspace.on('quit', () => { this.writeDb(this.db) }),
-		);
-
-
-		this.registerEvent(
-			this.app.vault.on('rename', (file, oldPath) => this.renameFile(file, oldPath)),
+			this.app.workspace.on("file-open", (file) => {
+				if (file) {
+					console.log(
+						`[Remember Cursor Position] File opened: ${file.name}. Restoring position...`,
+					);
+					this.restoreFilePositionForActiveLeaf();
+				}
+			}),
 		);
 
+		// Saves the database when Obsidian is closing
 		this.registerEvent(
-			this.app.vault.on('delete', (file) => this.deleteFile(file)),
+			this.app.workspace.on("quit", () => this.writeDb(this.db)),
 		);
 
-		//todo: replace by scroll and mouse cursor move events
-		this.registerInterval(
-			window.setInterval(() => this.checkEphemeralStateChanged(), 100)
+		// Renames the file in the database when a file is renamed
+		this.registerEvent(
+			this.app.vault.on("rename", (file, oldPath) =>
+				this.renameFile(file, oldPath),
+			),
+		);
+
+		// Removes database entry for a file when a file is deleted
+		this.registerEvent(
+			this.app.vault.on("delete", (file) => this.deleteFile(file)),
 		);
 
 		this.registerInterval(
 			window.setInterval(() => this.writeDb(this.db), this.settings.saveTimer)
 		);
 
-		this.restoreEphemeralState();
+		// Reference handler to plugin for cursor tracker to access
+		const plugin = this;
+
+		// Class to listen for any updates to the viewport (i.e. cursor or editor-change events)
+		const cursorTracker = ViewPlugin.fromClass(
+			class {
+				constructor(private view: EditorView) {}
+
+				update(update: ViewUpdate) {
+					if (!update.selectionSet) return;
+					// On every update, if the update happened and the file or the cursor
+					// is changed, update the cursor.
+					const currentFile =
+						plugin.app.workspace.getActiveFile()?.path;
+					if (!currentFile) return;
+
+					const selection = update.state.selection.main;
+					const fromPos = update.state.doc.lineAt(selection.from);
+					const toPos = update.state.doc.lineAt(selection.to);
+
+					// CodeMirror is 1-based, convert to 0-based
+					//
+					const currentState = {
+						cursor: {
+							from: {
+								line: fromPos.number - 1,
+								ch: selection.from - fromPos.from,
+							},
+							to: {
+								line: toPos.number - 1,
+								ch: selection.to - toPos.from,
+							},
+						},
+						scroll: this.view.scrollDOM.scrollTop,
+					} satisfies EphemeralState;
+
+					plugin.saveFilePositionIfChanged(currentFile, currentState);
+				}
+			},
+		);
+		this.registerEditorExtension(cursorTracker);
+
+		this.restoreFilePositionForActiveLeaf();
 	}
 
 	renameFile(file: TAbstractFile, oldPath: string) {
@@ -91,28 +139,26 @@ export default class RememberCursorPosition extends Plugin {
 		delete this.db[oldName];
 	}
 
-
 	deleteFile(file: TAbstractFile) {
 		let fileName = file.path;
 		delete this.db[fileName];
 	}
 
+	private saveFilePositionIfChanged(
+		fileName: string,
+		currentState: EphemeralState,
+	): void {
+		// Waiting for load new file
+		if (!fileName) return;
 
-	checkEphemeralStateChanged() {
-		let fileName = this.app.workspace.getActiveFile()?.path;
+		const previousState = this.db[fileName];
 
-		//waiting for load new file
-		if (!fileName || !this.lastLoadedFileName || fileName != this.lastLoadedFileName || this.loadingFile)
-			return;
-
-		let st = this.getEphemeralState();
-
-		if (!this.lastEphemeralState)
-			this.lastEphemeralState = st;
-
-		if (!isNaN(st.scroll) && !this.isEphemeralStatesEquals(st, this.lastEphemeralState)) {
-			this.saveEphemeralState(st);
-			this.lastEphemeralState = st;
+		if (
+			!previousState ||
+			(!isNaN(currentState.scroll) &&
+				!this.isEphemeralStatesEquals(currentState, previousState))
+		) {
+			this.saveEphemeralState(currentState);
 		}
 	}
 
@@ -146,61 +192,39 @@ export default class RememberCursorPosition extends Plugin {
 		return true;
 	}
 
+	async restoreFilePositionForActiveLeaf() {
+		const fileName = this.app.workspace.getActiveFile()?.path;
+		if (!fileName) return;
 
-	async saveEphemeralState(st: EphemeralState) {
-		let fileName = this.app.workspace.getActiveFile()?.path;
-		if (fileName && fileName == this.lastLoadedFileName) { //do not save if file changed or was not loaded
-			this.db[fileName] = st;
+		// If this leaf+file combination was already loaded, exit early
+		// This prevents duplicate restores for the same file
+		const activeLeaf = this.app.workspace.getMostRecentLeaf();
+		const loadedLeafId = [
+			activeLeaf.id,
+			activeLeaf.getViewState().state.file,
+		] as [LeafId, FileName];
+
+		if (activeLeaf && this.loadedLeavesCache.has(loadedLeafId)) return;
+
+		let state: EphemeralState;
+
+		// Get saved state from database
+		state = this.db[fileName];
+		if (!state) return;
+
+		// Wait for note to load
+		await this.delay(this.settings.delayAfterFileOpening);
+
+		// Don't scroll when a link scrolls and highlights text
+		// i.e. if file is open by links like [link](note.md#header) and wikilinks
+		// See #10, #32, #46, #51
+		let containsFlashingSpan =
+			this.app.workspace.containerEl.querySelector("span.is-flashing");
+
+		if (!containsFlashingSpan) {
+			await this.delay(10);
+			this.setEphemeralState(state);
 		}
-	}
-
-
-	async restoreEphemeralState() {
-		let fileName = this.app.workspace.getActiveFile()?.path;
-
-		if (fileName && this.loadingFile && this.lastLoadedFileName == fileName) //if already started loading
-			return;
-
-		let activeLeaf = this.app.workspace.getMostRecentLeaf()
-		if (activeLeaf && this.loadedLeafIdList.includes(activeLeaf.id + ':' + activeLeaf.getViewState().state.file))
-			return;
-		
-		this.loadedLeafIdList = []
-		this.app.workspace.iterateAllLeaves((leaf) => {
-			if (leaf.getViewState().type ==="markdown") {
-				this.loadedLeafIdList.push(leaf.id + ':' +  leaf.getViewState().state.file)
-			}
-		});
-		
-		this.loadingFile = true;
-
-		if (this.lastLoadedFileName != fileName) {
-			this.lastEphemeralState = {}
-			this.lastLoadedFileName = fileName;
-			
-			let st:EphemeralState
-
-			if (fileName) {
-				st = this.db[fileName];
-				if (st) {
-					//waiting for load note
-					await this.delay(this.settings.delayAfterFileOpening)
-
-					// Don't scroll when a link scrolls and highlights text
-					// i.e. if file is open by links like [link](note.md#header) and wikilinks
-					// See #10, #32, #46, #51
-					let containsFlashingSpan = this.app.workspace.containerEl.querySelector('span.is-flashing');
-
-					if (!containsFlashingSpan) {
-						await this.delay(10)
-						this.setEphemeralState(st);
-					}
-				}
-			} 
-			this.lastEphemeralState = st;
-		}
-
-		this.loadingFile = false;
 	}
 
 	async readDb(): Promise<{ [file_path: string]: EphemeralState; }> {
@@ -229,54 +253,28 @@ export default class RememberCursorPosition extends Plugin {
 		}
 	}
 
-
-
-	getEphemeralState(): EphemeralState {
-		// let state: EphemeralState = this.app.workspace.getActiveViewOfType(MarkdownView)?.getEphemeralState(); //doesn't work properly
-		
-		let state: EphemeralState = {};
-		state.scroll = Number(this.app.workspace.getActiveViewOfType(MarkdownView)?.currentMode?.getScroll()?.toFixed(4));
-		
-		let editor = this.getEditor();
-		if (editor) {
-			let from = editor.getCursor("anchor");
-			let to = editor.getCursor("head");
-			if (from && to) {
-				state.cursor = {
-					from: {
-						ch: from.ch,
-						line: from.line
-					},
-					to: {
-						ch: to.ch,
-						line: to.line
-					}
-				}
-			}
+	private async saveEphemeralState(st: EphemeralState) {
+		let fileName = this.app.workspace.getActiveFile()?.path;
+		if (fileName) {
+			//do not save if file changed or was not loaded
+			this.db[fileName] = st;
 		}
-
-		return state;
 	}
 
-	setEphemeralState(state: EphemeralState) {
+	private setEphemeralState(state: EphemeralState): void {
 		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
 
+		// Restore cursor
 		if (state.cursor) {
-			let editor = this.getEditor();
-			if (editor) {
-				editor.setSelection(state.cursor.from, state.cursor.to);
-			}
+			view.editor.setSelection(state.cursor.from, state.cursor.to);
 		}
 
-		if (view && state.scroll) {
+		// Restore scroll
+		if (state.scroll) {
 			view.setEphemeralState(state);
 			// view.previewMode.applyScroll(state.scroll);
 			// view.sourceMode.applyScroll(state.scroll);
 		}
-	}
-
-	private getEditor(): Editor {
-		return this.app.workspace.getActiveViewOfType(MarkdownView)?.editor;
 	}
 
 	async loadSettings() {
@@ -300,8 +298,6 @@ export default class RememberCursorPosition extends Plugin {
 	}
 }
 
-
-
 class SettingTab extends PluginSettingTab {
 	plugin: RememberCursorPosition;
 
@@ -322,12 +318,12 @@ class SettingTab extends PluginSettingTab {
 			.setDesc('Save positions to this file')
 			.addText((text) =>
 				text
-					.setPlaceholder('Example: cursor-positions.json')
+					.setPlaceholder("Example: cursor-positions.json")
 					.setValue(this.plugin.settings.dbFileName)
 					.onChange(async (value) => {
 						this.plugin.settings.dbFileName = value;
 						await this.plugin.saveSettings();
-					})
+					}),
 			);
 
 		new Setting(containerEl)
